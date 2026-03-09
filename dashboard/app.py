@@ -1,6 +1,5 @@
 # =========================================================
-# ⚡ Energy Forecasting & Monitoring Dashboard
-# Production-ready Streamlit App
+# ⚡ Energy Forecasting & Monitoring Dashboard (Dual-Model)
 # =========================================================
 
 import streamlit as st
@@ -9,6 +8,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import joblib
 import mlflow
+import shap
+import plotly.express as px
 from pathlib import Path
 from scipy.stats import ks_2samp
 
@@ -28,7 +29,8 @@ st.title("⚡ Energy Forecasting & Monitoring Platform")
 # =========================================================
 ROOT = Path(__file__).parent.parent
 DATA_PATH = ROOT / "data" / "energy_data.csv"
-MODEL_PATH = ROOT / "xgb_model.pkl"
+XGB_MODEL_PATH = ROOT / "xgb_model.pkl"
+SARIMA_MODEL_PATH = ROOT / "sarima_model.pkl"
 
 # =========================================================
 # Loaders
@@ -40,34 +42,29 @@ def load_baseline():
     return df
 
 @st.cache_resource
-def load_model():
-    if MODEL_PATH.exists():
-        return joblib.load(MODEL_PATH)
-    return None
+def load_models():
+    models = {}
+    if XGB_MODEL_PATH.exists():
+        models["XGBoost"] = joblib.load(XGB_MODEL_PATH)
+    if SARIMA_MODEL_PATH.exists():
+        models["SARIMA"] = joblib.load(SARIMA_MODEL_PATH)
+    return models
 
 @st.cache_data
 def load_runs():
     try:
         mlflow.set_tracking_uri("sqlite:///mlflow.db")
         runs = mlflow.search_runs()
-
         if runs.empty:
             return pd.DataFrame()
-
         cols = ["run_id", "metrics.MAE", "metrics.RMSE", "metrics.MAPE"]
         runs = runs[[c for c in cols if c in runs.columns]]
-
-        runs.rename(
-            columns={
-                "metrics.MAE": "MAE",
-                "metrics.RMSE": "RMSE",
-                "metrics.MAPE": "MAPE",
-            },
-            inplace=True,
-        )
-
+        runs.rename(columns={
+            "metrics.MAE": "MAE",
+            "metrics.RMSE": "RMSE",
+            "metrics.MAPE": "MAPE"
+        }, inplace=True)
         return runs.sort_values("MAE")
-
     except Exception:
         return pd.DataFrame()
 
@@ -77,49 +74,46 @@ def load_runs():
 def feature_drift(base, current):
     results = []
     numeric_cols = base.select_dtypes(include=np.number).columns
-
     for col in numeric_cols:
         if col not in current.columns:
             continue
-
         stat, p = ks_2samp(base[col].dropna(), current[col].dropna())
-
         if p < 0.01:
             level = "🔴 HIGH"
         elif p < 0.05:
             level = "🟡 MEDIUM"
         else:
             level = "🟢 LOW"
-
         results.append([col, stat, p, level])
-
     return pd.DataFrame(results, columns=["feature", "ks_stat", "p_value", "drift"])
 
-def local_predict(file):
-    model = load_model()
-    if model is None:
-        st.error("Model file not found.")
-        return None
-
+def local_predict_xgb(model, file):
     df = pd.read_csv(file)
     df["prediction"] = model.predict(df)
     return df
 
 # =========================================================
-# Load Data & Model
+# Load Data & Models
 # =========================================================
 baseline_df = load_baseline()
 runs_df = load_runs()
-model = load_model()
+models = load_models()
 
 # =========================================================
 # Sidebar Controls
 # =========================================================
 st.sidebar.header("⚙ Controls")
+
+# Model selector
+selected_model_name = st.sidebar.selectbox("Choose Model", list(models.keys()))
+selected_model = models[selected_model_name]
+
+# Date range filter
 date_range = st.sidebar.date_input(
     "Date Range",
-    [baseline_df["Date"].min(), baseline_df["Date"].max()],
+    [baseline_df["Date"].min(), baseline_df["Date"].max()]
 )
+
 show_rolling = st.sidebar.checkbox("Show 7-day average", value=True)
 filtered_df = baseline_df[
     (baseline_df["Date"] >= pd.to_datetime(date_range[0])) &
@@ -134,7 +128,6 @@ c1.metric("Total Records", len(filtered_df))
 c2.metric("Avg Energy", round(filtered_df["Energy"].mean(), 2))
 c3.metric("Max Energy", round(filtered_df["Energy"].max(), 2))
 c4.metric("Min Energy", round(filtered_df["Energy"].min(), 2))
-
 st.divider()
 
 # =========================================================
@@ -167,10 +160,8 @@ with tabs[0]:
 # TAB 2 — Forecast
 # =========================================================
 with tabs[1]:
-    st.subheader("7 Day Energy Forecast")
-    if model is None:
-        st.warning("Model not found")
-    else:
+    st.subheader("7 Day Forecast")
+    if selected_model_name == "XGBoost":
         future_dates = pd.date_range(start=baseline_df["Date"].max(), periods=7)
         future_df = pd.DataFrame({
             "Temperature": np.random.normal(25, 2, 7),
@@ -179,46 +170,58 @@ with tabs[1]:
             "rolling7": np.random.normal(310, 5, 7),
             "dayofweek": future_dates.dayofweek
         })
-        forecast = model.predict(future_df)
+        forecast = selected_model.predict(future_df)
         forecast_df = pd.DataFrame({"Date": future_dates, "Forecast": forecast})
+        st.line_chart(forecast_df.set_index("Date"))
+    elif selected_model_name == "SARIMA":
+        future_forecast = selected_model.forecast(7)
+        future_dates = pd.date_range(start=baseline_df["Date"].max(), periods=7)
+        forecast_df = pd.DataFrame({"Date": future_dates, "Forecast": future_forecast})
         st.line_chart(forecast_df.set_index("Date"))
 
 # =========================================================
 # TAB 3 — Predictions
 # =========================================================
 with tabs[2]:
-    st.subheader("Interactive Prediction")
-    col1, col2 = st.columns(2)
-    with col1:
-        temp = st.slider("Temperature", 0, 40, 25)
-        lag1 = st.slider("Yesterday Demand", 200, 500, 320)
-        lag7 = st.slider("Last Week Demand", 200, 500, 300)
-    with col2:
-        rolling7 = st.slider("7-Day Avg", 200, 500, 310)
-        day = st.selectbox("Day of Week", list(range(7)))
+    st.subheader("Interactive Prediction / CSV Upload")
+    if selected_model_name == "XGBoost":
+        col1, col2 = st.columns(2)
+        with col1:
+            temp = st.slider("Temperature", 0, 40, 25)
+            lag1 = st.slider("Yesterday Demand", 200, 500, 320)
+            lag7 = st.slider("Last Week Demand", 200, 500, 300)
+        with col2:
+            rolling7 = st.slider("7-Day Avg", 200, 500, 310)
+            day = st.selectbox("Day of Week", list(range(7)))
+        if st.button("Predict Demand"):
+            input_df = pd.DataFrame({
+                "Temperature":[temp],
+                "lag1":[lag1],
+                "lag7":[lag7],
+                "rolling7":[rolling7],
+                "dayofweek":[day]
+            })
+            pred = selected_model.predict(input_df)[0]
+            st.success(f"Predicted Energy Demand: {round(pred,2)}")
 
-    if st.button("Predict Demand"):
-        input_df = pd.DataFrame({
-            "Temperature":[temp],
-            "lag1":[lag1],
-            "lag7":[lag7],
-            "rolling7":[rolling7],
-            "dayofweek":[day]
-        })
-        pred = model.predict(input_df)[0]
-        st.success(f"Predicted Energy Demand: {round(pred,2)}")
-
-    st.divider()
-    st.subheader("Batch CSV Prediction")
-    uploaded = st.file_uploader("Upload CSV", type=["csv"])
-    if uploaded:
-        preds = local_predict(uploaded)
-        if preds is not None:
+            # SHAP explanation
+            explainer = shap.TreeExplainer(selected_model)
+            shap_values = explainer.shap_values(input_df)
+            st.subheader("SHAP Local Explanation")
+            shap.initjs()
+            shap.force_plot(explainer.expected_value, shap_values, input_df, matplotlib=True, show=True)
+        st.divider()
+        st.subheader("Batch CSV Prediction")
+        uploaded = st.file_uploader("Upload CSV", type=["csv"])
+        if uploaded:
+            preds = local_predict_xgb(selected_model, uploaded)
             st.dataframe(preds.head(), use_container_width=True)
             fig, ax = plt.subplots()
             ax.plot(preds["prediction"])
             ax.set_title("Prediction Output")
             st.pyplot(fig)
+    else:
+        st.info("Interactive sliders and SHAP explanations only available for XGBoost.")
 
 # =========================================================
 # TAB 4 — Drift Monitoring
@@ -253,31 +256,27 @@ with tabs[4]:
             st.bar_chart(runs_df.set_index("run_id")["RMSE"])
 
 # =========================================================
-# Feature Importance (Upgraded)
+# Feature Importance (XGBoost only)
 # =========================================================
 st.divider()
-st.subheader("🔎 Model Feature Importance")
-
-if model is not None and hasattr(model, "feature_importances_"):
+st.subheader("🔎 XGBoost Feature Importance")
+if selected_model_name == "XGBoost" and hasattr(selected_model, "feature_importances_"):
     features = ["Temperature","lag1","lag7","rolling7","dayofweek"]
-    importance = model.feature_importances_
+    importance = selected_model.feature_importances_
     fi_df = pd.DataFrame({"feature": features, "importance": importance}).sort_values("importance", ascending=True)
-
     fig, ax = plt.subplots(figsize=(8,4))
     colors = ["#1f77b4" if i < 0.6*fi_df["importance"].max() else "#ff7f0e" for i in fi_df["importance"]]
     ax.barh(fi_df["feature"], fi_df["importance"], color=colors)
-
     for i, (imp, feat) in enumerate(zip(fi_df["importance"], fi_df["feature"])):
         ax.text(imp + 0.01*fi_df["importance"].max(), i, f"{imp*100:.1f}%", va='center')
-
     ax.set_xlabel("Importance Score")
     ax.set_title("Model Feature Importance")
     st.pyplot(fig)
 else:
-    st.info("Model or feature importance not available.")
+    st.info("Feature importance only available for XGBoost.")
 
 # =========================================================
 # Footer
 # =========================================================
 st.divider()
-st.caption("⚡ Built with Streamlit • Energy Forecasting MLOps Dashboard")
+st.caption("⚡ Built with Streamlit • Dual-Model Energy Forecasting Dashboard")

@@ -10,3 +10,4 @@ mlflow
 shap
 aiofiles
 aiocsv
+plotly
